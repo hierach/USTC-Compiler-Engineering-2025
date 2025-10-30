@@ -60,7 +60,44 @@ Value *CminusfBuilder::visit(ASTNum &node) {
 Value *CminusfBuilder::visit(ASTVarDeclaration &node) {
     // TODO: This function is empty now.
     // Add some code here.
-    return nullptr;
+    // 判定基本类型
+    Type *elem_ty = (node.type == TYPE_INT) ? INT32_T : FLOAT_T;
+
+    bool is_global = (context.func == nullptr);
+    if (!node.num) {
+        // 标量
+        if (is_global) {
+            // 全局：必须零初始化
+            auto gv = GlobalVariable::create(
+                node.id, module.get(), elem_ty, /*is_const=*/false,
+                ConstantZero::get(elem_ty, module.get()));
+            scope.push(node.id, gv);
+            return gv;
+        } else {
+            // 局部：alloca
+            auto addr = builder->create_alloca(elem_ty);
+            scope.push(node.id, addr);
+            return addr;
+        }
+    } else {
+        // 数组
+        auto num = node.num->i_val; // 语法保证是整型字面量
+        auto arr_ty = ArrayType::get(elem_ty, num);
+
+        if (is_global) {
+            // 全局数组：零初始化
+            auto gv = GlobalVariable::create(
+                node.id, module.get(), arr_ty, /*is_const=*/false,
+                ConstantZero::get(arr_ty, module.get()));
+            scope.push(node.id, gv);
+            return gv;
+        } else {
+            // 局部数组：alloca 数组类型
+            auto addr = builder->create_alloca(arr_ty);
+            scope.push(node.id, addr);
+            return addr;
+        }
+    }
 }
 
 Value *CminusfBuilder::visit(ASTFunDeclaration &node) {
@@ -121,12 +158,31 @@ Value *CminusfBuilder::visit(ASTFunDeclaration &node) {
     return nullptr;
 }
 
-Value *CminusfBuilder::visit(ASTParam &node) { return nullptr; }
+Value *CminusfBuilder::visit(ASTParam &node) {
+    if (node.isarray) {
+        // 数组参数：存放成指针
+        Type *ptr_ty = (node.type == TYPE_INT) ? INT32PTR_T : FLOATPTR_T;
+        return builder->create_alloca(ptr_ty);
+    } else {
+        // 标量参数：存放成值
+        Type *val_ty = (node.type == TYPE_INT) ? INT32_T : FLOAT_T;
+        return builder->create_alloca(val_ty);
+    }
+}
 
 Value *CminusfBuilder::visit(ASTCompoundStmt &node) {
     // TODO: This function is not complete.
     // You may need to add some code here
     // to deal with complex statements.
+
+    bool need_enter = true;
+    if (context.pre_enter_scope) {
+        // 函数体的第一个 compound-stmt：作用域已在 FunDecl 中 enter 过
+        context.pre_enter_scope = false;
+        need_enter = false;
+    }
+    if (need_enter)
+        scope.enter();
 
     for (auto &decl : node.local_declarations) {
         decl->accept(*this);
@@ -134,9 +190,12 @@ Value *CminusfBuilder::visit(ASTCompoundStmt &node) {
 
     for (auto &stmt : node.statement_list) {
         stmt->accept(*this);
-        if (builder->get_insert_block()->get_terminator() == nullptr)
+        if (builder->get_insert_block()->is_terminated())
             break;
     }
+
+    if (need_enter)
+        scope.exit();
     return nullptr;
 }
 
@@ -189,6 +248,34 @@ Value *CminusfBuilder::visit(ASTSelectionStmt &node) {
 Value *CminusfBuilder::visit(ASTIterationStmt &node) {
     // TODO: This function is empty now.
     // Add some code here.
+    auto *func = context.func;
+    auto *condBB = BasicBlock::create(module.get(), "", func);
+    auto *bodyBB = BasicBlock::create(module.get(), "", func);
+    auto *afterBB = BasicBlock::create(module.get(), "", func);
+
+    // 先跳到条件块
+    builder->create_br(condBB);
+
+    // condBB
+    builder->set_insert_point(condBB);
+    auto *cond_val_any = node.expression->accept(*this);
+    Value *cond_i1 = nullptr;
+    if (cond_val_any->get_type()->is_integer_type()) {
+        cond_i1 = builder->create_icmp_ne(cond_val_any, CONST_INT(0));
+    } else {
+        cond_i1 = builder->create_fcmp_ne(cond_val_any, CONST_FP(0.));
+    }
+    builder->create_cond_br(cond_i1, bodyBB, afterBB);
+
+    // bodyBB
+    builder->set_insert_point(bodyBB);
+    node.statement->accept(*this);
+    if (!builder->get_insert_block()->is_terminated()) {
+        builder->create_br(condBB);
+    }
+
+    // afterBB
+    builder->set_insert_point(afterBB);
     return nullptr;
 }
 
@@ -303,7 +390,59 @@ Value *CminusfBuilder::visit(ASTAssignExpression &node) {
 Value *CminusfBuilder::visit(ASTSimpleExpression &node) {
     // TODO: This function is empty now.
     // Add some code here.
-    return nullptr;
+    if (node.additive_expression_r == nullptr)
+        return node.additive_expression_l->accept(*this);
+
+    auto *l_val = node.additive_expression_l->accept(*this);
+    auto *r_val = node.additive_expression_r->accept(*this);
+    bool is_int = promote(&*builder, &l_val, &r_val);
+
+    Value *cmp_i1 = nullptr;
+    if (is_int) {
+        switch (node.op) {
+        case OP_LE:
+            cmp_i1 = builder->create_icmp_le(l_val, r_val);
+            break;
+        case OP_LT:
+            cmp_i1 = builder->create_icmp_lt(l_val, r_val);
+            break;
+        case OP_GT:
+            cmp_i1 = builder->create_icmp_gt(l_val, r_val);
+            break;
+        case OP_GE:
+            cmp_i1 = builder->create_icmp_ge(l_val, r_val);
+            break;
+        case OP_EQ:
+            cmp_i1 = builder->create_icmp_eq(l_val, r_val);
+            break;
+        case OP_NEQ:
+            cmp_i1 = builder->create_icmp_ne(l_val, r_val);
+            break;
+        }
+    } else {
+        switch (node.op) {
+        case OP_LE:
+            cmp_i1 = builder->create_fcmp_le(l_val, r_val);
+            break;
+        case OP_LT:
+            cmp_i1 = builder->create_fcmp_lt(l_val, r_val);
+            break;
+        case OP_GT:
+            cmp_i1 = builder->create_fcmp_gt(l_val, r_val);
+            break;
+        case OP_GE:
+            cmp_i1 = builder->create_fcmp_ge(l_val, r_val);
+            break;
+        case OP_EQ:
+            cmp_i1 = builder->create_fcmp_eq(l_val, r_val);
+            break;
+        case OP_NEQ:
+            cmp_i1 = builder->create_fcmp_ne(l_val, r_val);
+            break;
+        }
+    }
+
+    return builder->create_zext(cmp_i1, INT32_T);
 }
 
 Value *CminusfBuilder::visit(ASTAdditiveExpression &node) {
